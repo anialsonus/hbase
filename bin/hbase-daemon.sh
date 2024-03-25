@@ -78,34 +78,22 @@ hbase_rotate_log ()
     fi
 }
 
-function sighup_handler
-{
-  # pass through SIGHUP if we can
-  if [ -f "${HBASE_PID}" ] ; then
-    kill -s HUP "$(cat "${HBASE_PID}")"
-  fi
-}
-
-function sigterm_handler
-{
-  if [ -f "${HBASE_PID}" ]; then
-    kill -s TERM "$(cat "${HBASE_PID}")"
-    waitForProcessEnd "$(cat "${HBASE_PID}")" "${command}"
-  fi
-  cleanAfterRun
-}
-
 cleanAfterRun() {
-  rm -f "${HBASE_PID}" > /dev/null 2>&1
-  if [ -f "${HBASE_ZNODE_FILE}" ]; then
-    if [ "${command}" = "master" ]; then
-      HBASE_OPTS="$HBASE_OPTS $HBASE_MASTER_OPTS" "${bin}/hbase" master clear > /dev/null 2>&1
+  if [ -f ${HBASE_PID} ]; then
+    # If the process is still running time to tear it down.
+    kill -9 `cat ${HBASE_PID}` > /dev/null 2>&1
+    rm -f ${HBASE_PID} > /dev/null 2>&1
+  fi
+
+  if [ -f ${HBASE_ZNODE_FILE} ]; then
+    if [ "$command" = "master" ]; then
+      HBASE_OPTS="$HBASE_OPTS $HBASE_MASTER_OPTS" $bin/hbase master clear > /dev/null 2>&1
     else
-      # call ZK to delete the node
-      ZNODE="$(cat "${HBASE_ZNODE_FILE}")"
-      HBASE_OPTS="$HBASE_OPTS $HBASE_REGIONSERVER_OPTS" "${bin}/hbase" zkcli delete "${ZNODE}" > /dev/null 2>&1
+      #call ZK to delete the node
+      ZNODE=`cat ${HBASE_ZNODE_FILE}`
+      HBASE_OPTS="$HBASE_OPTS $HBASE_REGIONSERVER_OPTS" $bin/hbase zkcli delete ${ZNODE} > /dev/null 2>&1
     fi
-    rm -f "${HBASE_ZNODE_FILE}" > /dev/null 2>&1
+    rm ${HBASE_ZNODE_FILE}
   fi
 }
 
@@ -183,10 +171,10 @@ export HBASE_ZNODE_FILE=$HBASE_PID_DIR/hbase-$HBASE_IDENT_STRING-$command.znode
 export HBASE_AUTOSTART_FILE=$HBASE_PID_DIR/hbase-$HBASE_IDENT_STRING-$command.autostart
 
 if [ -n "$SERVER_GC_OPTS" ]; then
-  export SERVER_GC_OPTS=${SERVER_GC_OPTS/"<FILE-PATH>"/"${HBASE_LOGGC}"}
+  export SERVER_GC_OPTS=${SERVER_GC_OPTS/"-Xloggc:<FILE-PATH>"/"-Xloggc:${HBASE_LOGGC}"}
 fi
 if [ -n "$CLIENT_GC_OPTS" ]; then
-  export CLIENT_GC_OPTS=${CLIENT_GC_OPTS/"<FILE-PATH>"/"${HBASE_LOGGC}"}
+  export CLIENT_GC_OPTS=${CLIENT_GC_OPTS/"-Xloggc:<FILE-PATH>"/"-Xloggc:${HBASE_LOGGC}"}
 fi
 
 # Set default scheduling priority
@@ -205,9 +193,9 @@ case $startStop in
     hbase_rotate_log $HBASE_LOGGC
     echo running $command, logging to $HBASE_LOGOUT
     $thiscmd --config "${HBASE_CONF_DIR}" \
-        foreground_start $command $args < /dev/null > ${HBASE_LOGOUT} 2>&1  &
+        foreground_start $command $args < /dev/null >> ${HBASE_LOGLOG} 2>&1  &
     disown -h -r
-    sleep 1; head "${HBASE_LOGOUT}"
+    sleep 1; head "${HBASE_LOGLOG}"
   ;;
 
 (autostart)
@@ -216,7 +204,7 @@ case $startStop in
     hbase_rotate_log $HBASE_LOGGC
     echo running $command, logging to $HBASE_LOGOUT
     nohup $thiscmd --config "${HBASE_CONF_DIR}" --autostart-window-size ${AUTOSTART_WINDOW_SIZE} --autostart-window-retry-limit ${AUTOSTART_WINDOW_RETRY_LIMIT} \
-        internal_autostart $command $args < /dev/null > ${HBASE_LOGOUT} 2>&1  &
+        internal_autostart $command $args < /dev/null >> ${HBASE_LOGLOG} 2>&1  &
   ;;
 
 (autorestart)
@@ -233,13 +221,11 @@ case $startStop in
     check_before_start
     hbase_rotate_log $HBASE_LOGOUT
     nohup $thiscmd --config "${HBASE_CONF_DIR}" --autostart-window-size ${AUTOSTART_WINDOW_SIZE} --autostart-window-retry-limit ${AUTOSTART_WINDOW_RETRY_LIMIT} \
-        internal_autostart $command $args < /dev/null > ${HBASE_LOGOUT} 2>&1  &
+        internal_autostart $command $args < /dev/null >> ${HBASE_LOGLOG} 2>&1  &
   ;;
 
 (foreground_start)
-    trap sighup_handler HUP
-    trap sigterm_handler INT TERM EXIT
-
+    trap cleanAfterRun SIGHUP SIGINT SIGTERM EXIT
     if [ "$HBASE_NO_REDIRECT_LOG" != "" ]; then
         # NO REDIRECT
         echo "`date` Starting $command on `hostname`"
@@ -251,12 +237,12 @@ case $startStop in
             $command "$@" start &
     else
         echo "`date` Starting $command on `hostname`" >> ${HBASE_LOGLOG}
-        echo "`ulimit -a`" >> "$HBASE_LOGLOG" 2>&1
+        echo "`ulimit -a`" >> "$HBASE_LOGOUT" 2>&1
         # in case the parent shell gets the kill make sure to trap signals.
         # Only one will get called. Either the trap or the flow will go through.
         nice -n $HBASE_NICENESS "$HBASE_HOME"/bin/hbase \
             --config "${HBASE_CONF_DIR}" \
-            $command "$@" start >> ${HBASE_LOGOUT} 2>&1 &
+            $command "$@" start >> ${HBASE_LOGLOG} 2>&1 &
     fi
     # Add to the command log file vital stats on our environment.
     hbase_pid=$!
@@ -279,7 +265,7 @@ case $startStop in
       else
         #if the file does not exist it means that it was not stopped properly by the stop command
         if [ ! -f "$HBASE_AUTOSTART_FILE" ]; then
-          echo "`date` HBase might be stopped removing the autostart file. Exiting Autostart process" >> ${HBASE_LOGOUT}
+          echo "`date` HBase might be stopped removing the autostart file. Exiting Autostart process" >> ${HBASE_LOGLOG}
           exit 1
         fi
 
@@ -302,7 +288,7 @@ case $startStop in
 
           #grep returns 0 if it found something, 1 otherwise
           if [ $? -eq 0 ]; then
-            echo "`date` hbase znode does not exist. Exiting Autostart process" >> ${HBASE_LOGOUT}
+            echo "`date` hbase znode does not exist. Exiting Autostart process" >> ${HBASE_LOGLOG}
             rm -f "$HBASE_AUTOSTART_FILE"
             exit 1
           fi
@@ -310,7 +296,7 @@ case $startStop in
           #If ZooKeeper cannot be found, then do not restart
           $bin/hbase zkcli stat $zkFullRunning 2>&1 | grep Exception | grep ConnectionLoss  1>/dev/null 2>&1
           if [ $? -eq 0 ]; then
-            echo "`date` zookeeper not found. Exiting Autostart process" >> ${HBASE_LOGOUT}
+            echo "`date` zookeeper not found. Exiting Autostart process" >> ${HBASE_LOGLOG}
             rm -f "$HBASE_AUTOSTART_FILE"
             exit 1
           fi
@@ -322,7 +308,7 @@ case $startStop in
 
       # reset the auto start window size if it exceeds
       if [ $AUTOSTART_WINDOW_SIZE -gt 0 ] && [ $(( $curDate - $autostartWindowStartDate )) -gt $(( $AUTOSTART_WINDOW_SIZE * $ONE_HOUR_IN_SECS )) ]; then
-        echo "Resetting Autorestart window size: $autostartWindowStartDate" >> ${HBASE_LOGOUT}
+        echo "Resetting Autorestart window size: $autostartWindowStartDate" >> ${HBASE_LOGLOG}
         autostartWindowStartDate=$curDate
         autostartWindowReset=true
         autostartCount=0
@@ -341,7 +327,7 @@ case $startStop in
   ;;
 
 (stop)
-    echo running $command, logging to $HBASE_LOGOUT
+    echo running $command, logging to $HBASE_LOGLOG
     rm -f "$HBASE_AUTOSTART_FILE"
     if [ -f $HBASE_PID ]; then
       pidToKill=`cat $HBASE_PID`
@@ -362,7 +348,7 @@ case $startStop in
   ;;
 
 (restart)
-    echo running $command, logging to $HBASE_LOGOUT
+    echo running $command, logging to $HBASE_LOGLOG
     # stop the command
     $thiscmd --config "${HBASE_CONF_DIR}" stop $command $args &
     wait_until_done $!
